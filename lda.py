@@ -321,7 +321,7 @@ def model_fn(features, labels, mode, params, config):
 
 #     return _input_fn
 
-def input_fn(sparse_matrix, shuffle_and_repeat):
+def input_fn(sparse_matrix, shuffle_and_repeat, batch_size):
     # doc_ids, col_ids = zip(*all_docs)
     # num_documents = len(set(doc_ids))
 
@@ -336,29 +336,34 @@ def input_fn(sparse_matrix, shuffle_and_repeat):
     num_words = sparse_matrix.shape[1]
     dataset = tf.data.Dataset.range(num_documents)
 
-    # For training, we shuffle each epoch and repeat the epochs.
-    if shuffle_and_repeat:
-        dataset = dataset.shuffle(num_documents).repeat()
-
-    # Returns a single document as a dense TensorFlow tensor. The dataset is
-    # stored as a sparse matrix outside of the graph.
     def get_row_py_func(idx):
         def get_row_python(idx_py):
             return np.squeeze(np.array(sparse_matrix[idx_py].todense()), axis=0)
 
-        py_func = tf.compat.v1.py_func(
-            get_row_python, [idx], tf.float32, stateful=False
+        py_func = tf.compat.v1.numpy_function(
+            get_row_python, [idx], tf.float32, #stateful=False
         )
         py_func.set_shape((num_words,))
         return py_func
 
-    dataset = dataset.map(get_row_py_func)
-    dataset = dataset.batch(32).prefetch(32)
+    dataset = dataset.map(get_row_py_func, num_parallel_calls=72).cache()
+
+    # For training, we shuffle each epoch and repeat the epochs.
+    if shuffle_and_repeat:
+        dataset = dataset.shuffle(num_documents).repeat()
+        # dataset.apply(tf.data.experimental.shuffle_and_repeat(num_documents))
+
+    # dataset = dataset
+
+    # Returns a single document as a dense TensorFlow tensor. The dataset is
+    # stored as a sparse matrix outside of the graph.
+    # AUTOTUNE = tf.data.experimental.AUTOTUNE
+    dataset = dataset.batch(batch_size).prefetch(batch_size)
     return tf.compat.v1.data.make_one_shot_iterator(dataset).get_next()
 
 
 class LDA:
-    """Latent Dirichlet Allocation implemented in stan."""
+    """Latent Dirichlet Allocation."""
 
     def __init__(
         self,
@@ -372,7 +377,6 @@ class LDA:
         beta=1,
         learning_rate=3e-4,
         prior_burn_in_steps=120000,
-        chains=4,
         delete_existing=True,
         model_dir=os.path.join(os.getenv("TEST_TMPDIR", "/tmp"), "lda/"),
         save_checkpoints_steps=10000,
@@ -392,7 +396,6 @@ class LDA:
         self.shuffle_and_repeat = shuffle_and_repeat
         self.prior_burn_in_steps = prior_burn_in_steps
 
-        self.chains = chains
         self.model_dir = model_dir
         self.save_checkpoints_steps = save_checkpoints_steps
         self.delete_existing = delete_existing
@@ -428,8 +431,8 @@ class LDA:
             ),
         )
 
-        _input_fn = lambda: input_fn(X, self.shuffle_and_repeat)
-        _input_fn_eval = lambda: input_fn(X_val if X_val is not None else X, False)
+        _input_fn = lambda: input_fn(X, self.shuffle_and_repeat, self.batch_size)
+        _input_fn_eval = lambda: input_fn(X_val if X_val is not None else X, False, self.batch_size)
         for _ in range(self.max_steps // self.save_checkpoints_steps):
             estimator.train(_input_fn, steps=self.save_checkpoints_steps)
             eval_results = estimator.evaluate(_input_fn_eval)
